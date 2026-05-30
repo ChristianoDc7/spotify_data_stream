@@ -1,0 +1,194 @@
+name: SPOTIFY CI — Tests & Validation
+
+on:
+  push:
+    branches:
+      - 'groupe-*/main'
+      - 'groupe-*/feat/**'
+      - main
+  pull_request:
+    branches:
+      - main
+      - 'groupe-*/main'
+
+jobs:
+
+  # ─── JOB 1 : Tests Python ───────────────────────────────────
+  python-tests:
+    name: "Tests Python & Structure DAGs"
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Installer les dépendances
+        run: |
+          pip install --upgrade pip
+          pip install faker boto3 redis pytest pytest-cov apache-airflow==2.9.1 \
+            scikit-learn pandas pyarrow psycopg2-binary
+
+      - name: Vérifier la syntaxe de tous les fichiers Python
+        run: |
+          echo "=== Vérification syntaxe ==="
+          find . -name "*.py" -not -path "*/.git/*" | while read f; do
+            python3 -m py_compile "$f" && echo "✅ $f" || echo "❌ $f"
+          done
+
+      - name: Tests unitaires — DataGenerator
+        run: |
+          echo "=== Tests unitaires ==="
+          python3 -m pytest tests/unit/test_transformations.py::TestDataGenerator \
+            -v --tb=short
+
+      - name: Tests structure DAGs
+        env:
+          AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+          AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: 'sqlite:////tmp/airflow_test.db'
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          echo "=== Init Airflow DB ==="
+          airflow db init 2>/dev/null || true
+          echo "=== Tests structure DAGs ==="
+          python3 -m pytest tests/structure/test_dag_structure.py \
+            -v --tb=short || true
+
+      - name: Rapport de couverture
+        run: |
+          python3 -m pytest tests/unit/ \
+            --cov=src --cov-report=term-missing \
+            --tb=short || true
+
+  # ─── JOB 2 : Validation SQL ─────────────────────────────────
+  sql-validation:
+    name: "Validation Schéma SQL"
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: airflow
+          POSTGRES_PASSWORD: airflow
+          POSTGRES_DB: airflow
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Initialiser le schéma PostgreSQL
+        env:
+          PGPASSWORD: airflow
+        run: |
+          echo "=== Création base spotify ==="
+          psql -h localhost -U airflow -c "CREATE DATABASE spotify;" || true
+          psql -h localhost -U airflow spotify -f sql/init_spotify_db.sql
+          echo "=== Tables créées ==="
+          psql -h localhost -U airflow spotify -c "\dt"
+
+      - name: Vérifier les tables attendues
+        env:
+          PGPASSWORD: airflow
+        run: |
+          TABLES="artists albums tracks peers listening_events daily_streams dead_letter_events realtime_top_tracks fraud_detections federated_catalog recommendations"
+          ALL_OK=true
+          for table in $TABLES; do
+            EXISTS=$(psql -h localhost -U airflow spotify -tAc \
+              "SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_name='$table');")
+            if [ "$EXISTS" = "t" ]; then
+              echo "✅ Table: $table"
+            else
+              echo "❌ Table manquante: $table"
+              ALL_OK=false
+            fi
+          done
+          $ALL_OK || exit 1
+
+  # ─── JOB 3 : Docker Compose ─────────────────────────────────
+  docker-stack:
+    name: "Validation Docker Compose"
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Valider docker-compose.yml
+        run: |
+          docker compose config --quiet && echo "✅ docker-compose.yml valide"
+
+      - name: Démarrer la stack Phase 1
+        run: |
+          docker compose up -d postgres redis minio minio-init
+          echo "⏳ Attente démarrage..."
+          sleep 30
+
+      - name: Vérifier les services
+        run: |
+          docker compose ps
+          # PostgreSQL
+          docker compose exec -T postgres pg_isready -U airflow && echo "✅ PostgreSQL UP"
+          # Redis
+          docker compose exec -T redis redis-cli ping && echo "✅ Redis UP"
+          # MinIO
+          curl -sf http://localhost:9000/minio/health/live && echo "✅ MinIO UP"
+
+      - name: Tester le générateur de données
+        run: |
+          pip install faker boto3 -q
+          python3 -m src.data_generator.generate_catalog --artists 3
+          ls data/labels/ && echo "✅ Catalogues générés"
+
+      - name: Arrêter la stack
+        if: always()
+        run: docker compose down -v
+
+  # ─── JOB 4 : Code Quality ───────────────────────────────────
+  code-quality:
+    name: "Qualité du code"
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Installer ruff
+        run: pip install ruff
+
+      - name: Linting (warnings only)
+        run: |
+          ruff check . --ignore E501,E402,F401 || true
+          echo "✅ Linting terminé"
+
+      - name: Vérifier les TODO restants
+        run: |
+          echo "=== TODO non implémentés ==="
+          grep -rn "raise NotImplementedError" dags/ src/ spark_jobs/ | \
+            awk -F: '{print "⚠️  " $1 ":" $2}' || true
+          TODO_COUNT=$(grep -rn "raise NotImplementedError" dags/ src/ spark_jobs/ | wc -l)
+          echo "Total TODO restants: $TODO_COUNT"
+
+      - name: Résumé avancement
+        run: |
+          echo "=== RÉSUMÉ AVANCEMENT ==="
+          TOTAL=$(grep -rn "raise NotImplementedError" dags/ src/ spark_jobs/ | wc -l)
+          echo "TODO restants : $TOTAL"
+          if [ "$TOTAL" -eq 0 ]; then
+            echo "🎉 Tous les TODO sont implémentés !"
+          else
+            echo "📝 $TOTAL fonctions restent à implémenter"
+          fi
