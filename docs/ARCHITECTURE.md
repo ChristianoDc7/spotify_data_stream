@@ -38,10 +38,10 @@ graph TD
 
 | Pipeline | Approche | Justification |
 |----------|----------|---------------|
-| catalog_ingestion | ETL | ... |
-| streaming_events | ... | ... |
-| aggregation | ... | ... |
-| streaming_trends (Spark) | ... | ... |
+| catalog_ingestion | **ETL** | Le script `generate_catalog.py` produit les données brutes. Airflow les valide et déduplique (Transform) avant de les insérer dans PostgreSQL (Load). La transformation est nécessaire avant le stockage car les données peuvent contenir des doublons ou des artistes sans genre. |
+| streaming_events | **ETL** | Les événements Redis pub/sub sont consommés par Airflow qui les enrichit (jointure avec `tracks` et `peers` pour valider les IDs) avant insertion dans `listening_events`. Le Transform se fait en mémoire dans l'opérateur Python, pas dans la DB. |
+| aggregation | **ELT** | Les événements sont déjà dans PostgreSQL (`listening_events`). L'agrégation se fait via une requête SQL directement dans la base cible (`INSERT INTO daily_streams SELECT ... FROM listening_events GROUP BY ...`). La transformation IS le SQL — pas besoin de sortir les données du moteur. |
+| streaming_trends (Spark) | **ETL** | Kafka joue le rôle de staging. Spark extrait les événements, les transforme en fenêtres agrégées (windowed aggregation, watermark pour les événements tardifs), puis charge le résultat dans `realtime_top_tracks`. Le Transform est distribué dans le cluster Spark avant d'atteindre la destination. |
 
 ### Partitionnement Parquet
 
