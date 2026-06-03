@@ -40,7 +40,7 @@ logger = logging.getLogger("p2p_simulator")
 # CONFIGURATION
 # ─────────────────────────────────────────────────────────────
 
-REDIS_URL = "redis://localhost:6379/1"
+REDIS_URL = "redis://localhost:6380/1"
 KAFKA_BOOTSTRAP = "kafka-1:9092"       # Phase 2
 
 TOPICS = {
@@ -159,15 +159,19 @@ class P2PSimulator:
             - timestamp décalé de -5 à -30 minutes dans le passé
         """
         track = random.choice(SAMPLE_TRACKS)
+        duration_ms = random.randint(30000, track["duration_ms"])
 
-        # TODO : compléter ici
         event = {
-            "event_id":    str(uuid.uuid4()),
-            "user_id":     random.choice(SAMPLE_USERS),
-            "track_id":    track["id"],
-            "source_peer": random.choice(self.active_peers),
-            "timestamp":   datetime.utcnow().isoformat() + "Z",
-            # À compléter...
+            "event_id":     str(uuid.uuid4()),
+            "user_id":      random.choice(SAMPLE_USERS),
+            "track_id":     track["id"],
+            "source_peer":  random.choice(self.active_peers),
+            "timestamp":    datetime.utcnow().isoformat() + "Z",
+            "duration_ms":  duration_ms,
+            "device_type":  random.choice(DEVICE_TYPES),
+            "geo_country":  random.choice(GEO_COUNTRIES),
+            "completed":    duration_ms > 30000,
+            "event_source": random.choice(EVENT_SOURCES),
         }
 
         # Mode fraud (Phase 2) — décommenter
@@ -199,14 +203,34 @@ class P2PSimulator:
             "chunk_transfer", "cache_hit", "cache_miss"
         ])
 
-        # TODO : compléter selon event_type
         event = {
             "event_id":   str(uuid.uuid4()),
             "event_type": event_type,
             "peer_id":    random.choice(self.active_peers),
             "timestamp":  datetime.utcnow().isoformat() + "Z",
-            # À compléter...
         }
+
+        if event_type == "peer_connect":
+            event["geo_country"] = random.choice(GEO_COUNTRIES)
+            event["device_type"] = random.choice(DEVICE_TYPES)
+
+        elif event_type == "peer_disconnect":
+            event["session_duration_s"] = random.randint(30, 3600)
+
+        elif event_type == "chunk_transfer":
+            event["target_peer"]      = random.choice(self.active_peers)
+            event["track_id"]         = random.choice(SAMPLE_TRACKS)["id"]
+            event["chunk_size_bytes"] = random.choice([32768, 65536, 131072])
+            event["latency_ms"]       = random.randint(5, 200)
+
+        elif event_type == "cache_hit":
+            event["track_id"]   = random.choice(SAMPLE_TRACKS)["id"]
+            event["cache_size"] = random.randint(1, 50)
+
+        elif event_type == "cache_miss":
+            event["track_id"]    = random.choice(SAMPLE_TRACKS)["id"]
+            event["target_peer"] = random.choice(self.active_peers)
+
         return event
 
     # ── Publication ──────────────────────────────────────────
@@ -226,7 +250,12 @@ class P2PSimulator:
         Utiliser self.redis.publish(channel, payload)
         Gérer l'exception si Redis est indisponible (log + skip).
         """
-        raise NotImplementedError("TODO : implémenter _publish_to_redis()")
+        try:
+            self.redis.publish(channel, payload)
+            # DAG micro-batch consomme depuis une LIST (pub/sub ne persiste pas)
+            self.redis.lpush(channel + "_queue", payload)
+        except redis.RedisError as e:
+            logger.error(f"Redis indisponible, événement ignoré — channel={channel} error={e}")
 
     # def _publish_to_kafka(self, topic: str, key: str, payload: str):
     #     """
