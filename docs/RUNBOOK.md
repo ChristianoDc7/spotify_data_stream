@@ -7,70 +7,94 @@
 
 ## Incidents Phase 1 — Airflow / Batch
 
-### INC-01 — DAG bloqué en "running" depuis > 30 minutes
+### INC-01 — DAG bloqué en `queued` sans démarrer
 
-**Symptômes :** Une tâche reste en état `running` dans l'UI Airflow.
+**Symptômes :** Un DAGRun reste en état `queued` dans l'UI sans jamais passer en `running`.
+
+**Causes fréquentes :**
+- Le DAG est **paused** (toggle gris dans l'UI)
+- Le Celery worker n'est pas connecté à Redis (broker down ou mauvais port)
 
 **Diagnostic :**
 ```bash
-# Voir les logs de la tâche
-docker compose logs airflow-worker -f
+# Vérifier l'état des containers
+docker compose ps
 
-# Lister les tâches actives
-docker exec airflow-scheduler airflow tasks states-for-dag-run <dag_id> <run_id>
+# Vérifier que le worker est connecté
+docker logs spotify_data_stream-airflow-worker-1 2>&1 | tail -5
+# Doit afficher : "Connected to redis://redis:6379/0" et "celery@... ready."
+
+# Vérifier si le DAG est paused
+docker exec spotify_data_stream-airflow-scheduler-1 airflow dags list | grep <dag_id>
 ```
 
 **Résolution :**
 ```bash
-# Marquer la tâche comme failed manuellement
-docker exec airflow-scheduler airflow tasks clear <dag_id> -t <task_id> --yes
+# Unpause le DAG
+docker exec spotify_data_stream-airflow-scheduler-1 airflow dags unpause <dag_id>
 
-# Ou tuer le worker et le relancer
+# Si le worker est down
 docker compose restart airflow-worker
-```
 
-**Cause probable :** → À compléter par votre groupe après avoir rencontré cet incident
+# Retrigger le run
+docker exec spotify_data_stream-airflow-scheduler-1 airflow dags trigger <dag_id>
+```
 
 ---
 
-### INC-02 — PostgreSQL : `too many connections`
+### INC-02 — Conflit de port entre service local et Docker (Redis / PostgreSQL)
 
-**Symptômes :** Les tâches Airflow échouent avec `FATAL: too many connections`.
+**Symptômes :**
+- Le simulateur P2P publie des events mais le DAG consomme 0 événements
+- `psql` retourne `role "spotify" does not exist` malgré le container postgres healthy
+
+**Cause :** Un service Mac local (PostgreSQL ou Redis installé via Homebrew) est déjà en écoute sur le même port que Docker (`5432` ou `6379`). Les deux services coexistent mais `localhost` résout vers le service local.
 
 **Diagnostic :**
-```sql
-SELECT count(*), state FROM pg_stat_activity GROUP BY state;
-SELECT max_conn FROM pg_settings WHERE name='max_connections';
+```bash
+# Voir tous les processus sur le port
+lsof -i :6379   # ou :5432
+# Si deux lignes : un process "postgres"/"redis-ser" ET "com.docke" → conflit
 ```
 
 **Résolution :**
 ```bash
-# Augmenter max_connections dans docker-compose
-# PostgreSQL environment: POSTGRES_MAX_CONNECTIONS: 200
+# Changer le port exposé dans docker-compose.yml
+# Redis : "6380:6379" au lieu de "6379:6379"
+# PostgreSQL : "5433:5432" au lieu de "5432:5432"
 
-# Court terme : killer les connexions idle
-# SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE state='idle';
+# Mettre à jour REDIS_URL dans le simulateur
+# REDIS_URL = "redis://localhost:6380/1"
+
+docker compose down && docker compose up -d
 ```
-
-**Prévention :** → À compléter (hint : Airflow pools)
 
 ---
 
-### INC-03 — MinIO inaccessible depuis Airflow
+### INC-03 — Inserts PostgreSQL silencieusement ignorés (FK violation)
 
-**Symptômes :** Les tâches de lecture/écriture Parquet échouent avec `Connection refused`.
+**Symptômes :** Le DAG tourne vert, `upsert_to_postgres` retourne `inserted=0, skipped=N` sans erreur visible. `SELECT COUNT(*) FROM listening_events` reste à 0.
+
+**Cause :** Une contrainte de clé étrangère (`source_peer_id → peers`) rejette les inserts car le simulateur génère des UUIDs aléatoires non présents dans la table `peers`.
 
 **Diagnostic :**
 ```bash
-docker compose ps minio
-curl http://localhost:9000/minio/health/live
+# Vérifier les contraintes FK de la table
+docker exec spotify_data_stream-postgres-1 psql -U airflow -d spotify -c "\d listening_events"
+
+# Tester un insert manuel pour voir l'erreur brute
+docker exec spotify_data_stream-postgres-1 psql -U airflow -d spotify -c \
+  "INSERT INTO listening_events (id, user_id, track_id, timestamp, duration_ms) VALUES (gen_random_uuid(), gen_random_uuid(), gen_random_uuid(), NOW(), 30000);"
 ```
 
-**Résolution :**
+**Résolution (Phase 1 — données simulées) :**
 ```bash
-docker compose restart minio
-# Attendre 10s puis relancer le DAGRun
+# Supprimer la contrainte FK temporairement
+docker exec spotify_data_stream-postgres-1 psql -U airflow -d spotify -c \
+  "ALTER TABLE listening_events DROP CONSTRAINT listening_events_source_peer_id_fkey;"
 ```
+
+**Prévention (Phase 2) :** Charger d'abord le catalogue (issue #4) pour que les `track_id` et `peer_id` existent réellement dans les tables référencées avant d'activer les FK.
 
 ---
 

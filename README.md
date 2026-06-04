@@ -10,12 +10,64 @@ Ce projet se construit **brique par brique sur 5 jours**. Chaque livrable s'appu
 
 ## Ce que vous allez construire
 
+### Architecture Phase 1 (implémentée)
+
+```mermaid
+graph TD
+    SIM["🎵 Simulateur P2P<br/>(src/p2p_simulator)"]
+
+    subgraph Redis["Redis :6380"]
+        RL["listening_events_queue LIST"]
+        RP["p2p_network_events_queue LIST"]
+    end
+
+    subgraph Airflow["Apache Airflow :8080"]
+        DAG1["streaming_events_pipeline<br/>⏱ toutes les 5 min"]
+        DAG2["catalog_ingestion_pipeline<br/>⏱ quotidien 02h00"]
+        DAG3["aggregation_pipeline<br/>⏱ quotidien 04h00"]
+        DAG4["dlq_reprocessing_pipeline<br/>⏱ toutes les heures"]
+    end
+
+    subgraph Postgres["PostgreSQL :5433"]
+        T1["listening_events"]
+        T2["tracks / artists / albums"]
+        T3["daily_streams / artist_stats"]
+        T4["dead_letter_events (DLQ)"]
+    end
+
+    subgraph MinIO["MinIO :9001"]
+        B1["spotify-parquet/<br/>listening_events/date=/hour=/<br/>.parquet"]
+        B2["labels-raw/<br/>*.json"]
+    end
+
+    SIM -->|lpush| RL
+    SIM -->|lpush| RP
+
+    DAG1 -->|lrange + delete| RL
+    DAG1 -->|lrange + delete| RP
+    DAG1 -->|upsert| T1
+    DAG1 -->|écriture Parquet| B1
+    DAG1 -->|invalides| T4
+
+    DAG2 -->|lecture JSONs| B2
+    DAG2 -->|upsert| T2
+
+    DAG3 -->|ExternalTaskSensor| DAG1
+    DAG3 -->|GROUP BY| T1
+    DAG3 -->|upsert| T3
+
+    DAG4 -->|pending events| T4
+    DAG4 -->|réinjection| T1
+```
+
+### Architecture cible Phase 2 (Kafka + Spark)
+
 ```
 Sources ──► Kafka topics ──► Spark Streaming ──► PostgreSQL / Redis
               │                                         │
               └──► Airflow DAGs (batch) ────────────────┘
                                                         │
-                                              MinIO (Parquet)
+                                              MinIO (Parquet + checkpoints)
 ```
 
 | Couche | Technologie | Ce que vous implémentez |
