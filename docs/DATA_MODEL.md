@@ -4,6 +4,58 @@ https://dbdiagram.io/d/6a1d87582eeb2f46cd329459
 
 ---
 
+## Présentation des tables
+
+### Catalogue musical
+
+| Table | Rôle |
+|-------|------|
+| `genres` | Liste de référence des genres musicaux (Pop, Rock, Jazz...). Sert à normaliser les genres dans tout le catalogue. |
+| `artists` | Les artistes référencés sur la plateforme, avec leur label, pays et nombre d'auditeurs mensuels. C'est la table racine du catalogue. |
+| `albums` | Les albums de chaque artiste. Chaque album appartient à un artiste et contient plusieurs tracks. |
+| `tracks` | Les morceaux disponibles sur la plateforme avec leur durée, genre, BPM et chemin vers le fichier audio sur MinIO. C'est la table la plus consultée par les pipelines. |
+
+### Réseau P2P et utilisateurs
+
+| Table | Rôle |
+|-------|------|
+| `peers` | Les appareils connectés au réseau P2P (mobile, desktop, enceinte connectée...). Chaque peer peut servir des morceaux en cache aux autres. |
+
+### Événements d'écoute
+
+| Table | Rôle |
+|-------|------|
+| `listening_events` | Chaque ligne représente une écoute : quel utilisateur a écouté quel morceau, depuis quel appareil, depuis quel pays, pendant combien de temps. C'est la table centrale de la plateforme — tout le reste en dérive. |
+
+### Agrégats batch
+
+| Table | Rôle |
+|-------|------|
+| `daily_streams` | Les statistiques quotidiennes par morceau (nombre de streams, auditeurs uniques, durée totale). Calculées chaque nuit par `aggregation_pipeline`. C'est la source de vérité pour les royalties et les charts officiels. |
+| `artist_stats` | Les statistiques quotidiennes par artiste (streams, auditeurs uniques, morceau phare du jour). Calculées en même temps que `daily_streams`. |
+| `recommendations` | Le top-10 de recommandations par utilisateur généré par `recommendation_pipeline`. Persisté ici pour l'historique et l'audit, Redis étant le cache d'accès rapide. |
+
+### Résilience
+
+| Table | Rôle |
+|-------|------|
+| `dead_letter_events` | La "poubelle intelligente" : les événements invalides rejetés par les pipelines y sont stockés avec le message d'erreur, puis retraités périodiquement par `dlq_reprocessing_pipeline`. Rien n'est perdu définitivement. |
+
+### Temps réel (Phase 2 — alimentées par Spark)
+
+| Table | Rôle |
+|-------|------|
+| `realtime_top_tracks` | Le classement des morceaux mis à jour toutes les 5 minutes par Spark Streaming. Contrairement à `daily_streams` qui est figée à J-1, cette table reflète les tendances de la dernière heure. |
+| `fraud_detections` | Les alertes générées par le job de détection de fraude Spark : bots qui streament en rafale, comportements suspects. Chaque alerte contient le type de fraude, le score de suspicion et les preuves. |
+
+### Fédération inter-groupes (Phase 3)
+
+| Table | Rôle |
+|-------|------|
+| `federated_catalog` | Les morceaux partagés par les autres groupes via le réseau P2P inter-groupes. Permet à notre plateforme de proposer des tracks qui ne viennent pas de nos 3 labels. |
+
+---
+
 ## Questions de modélisation
 
 ### Pourquoi `listening_events` a deux index sur le timestamp ?

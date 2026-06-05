@@ -114,10 +114,26 @@ def save_as_json(catalog: dict, output_path: Path):
     print(f"Catalogue sauvegardé : {output_path} ({catalog['stats']})")
 
 
+def upload_to_minio(output_dir: Path, endpoint: str = "http://localhost:9000"):
+    """Upload les JSON générés dans le bucket labels-raw de MinIO."""
+    import boto3
+    s3 = boto3.client(
+        "s3",
+        endpoint_url=endpoint,
+        aws_access_key_id="minioadmin",
+        aws_secret_access_key="minioadmin",
+    )
+    for json_file in output_dir.glob("*.json"):
+        s3.upload_file(str(json_file), "labels-raw", json_file.name)
+        print(f"Uploadé : {json_file.name} → s3://labels-raw/{json_file.name}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="SPOTIFY Catalog Generator")
     parser.add_argument("--artists", type=int, default=10, help="Artistes par label")
     parser.add_argument("--output",  type=str, default="data/labels", help="Dossier de sortie")
+    parser.add_argument("--upload",  action="store_true", help="Uploader automatiquement sur MinIO")
+    parser.add_argument("--minio",   type=str, default="http://localhost:9000", help="Endpoint MinIO")
     args = parser.parse_args()
 
     output_dir = Path(args.output)
@@ -127,7 +143,11 @@ def main():
         save_as_json(catalog, output_dir / filename)
 
     print(f"\n3 catalogues générés dans {output_dir}/")
-    print("Prochaine étape : uploader sur MinIO et lancer le DAG catalog_ingestion_pipeline")
+
+    if args.upload:
+        print("\nUpload vers MinIO...")
+        upload_to_minio(output_dir, args.minio)
+        print("Upload terminé. Lancer le DAG catalog_ingestion_pipeline.")
 
 
 if __name__ == "__main__":
